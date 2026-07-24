@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: docflow-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    envVars:
+      - key: MONGODB_URI
+        sync: false # your Atlas connection string, set manually in the dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false # optional, set manually in the Render dashboard, don't commit it
