@@ -80,3 +80,33 @@ async def test_get_nonexistent_document_returns_404(client):
 async def test_get_document_with_malformed_id_returns_404(client):
     resp = await client.get("/documents/not-a-valid-object-id")
     assert resp.status_code == 404
+
+
+async def test_delete_document_removes_it(client, sample_pdf_bytes):
+    doc = (
+        await client.post(
+            "/documents",
+            files={"file": ("test.pdf", sample_pdf_bytes, "application/pdf")},
+        )
+    ).json()
+
+    resp = await client.delete(f"/documents/{doc['id']}")
+    assert resp.status_code == 204
+
+    assert (await client.get(f"/documents/{doc['id']}")).status_code == 404
+
+
+async def test_delete_nonexistent_document_returns_404(client):
+    resp = await client.delete("/documents/000000000000000000000000")
+    assert resp.status_code == 404
+
+
+async def test_clear_all_removes_every_document(client, sample_pdf_bytes):
+    await client.post(
+        "/documents", files={"file": ("test.pdf", sample_pdf_bytes, "application/pdf")}
+    )
+
+    resp = await client.delete("/documents")
+    assert resp.status_code == 204
+
+    assert (await client.get("/documents")).json() == []

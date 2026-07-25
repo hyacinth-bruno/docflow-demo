@@ -20,6 +20,7 @@ WHAT IS SIMULATED vs REAL in this demo (see README for the full mapping):
 
 import asyncio
 import hashlib
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,12 +29,17 @@ from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from .chat import answer_question
 from .db import build_engine
 from .extraction import extract_fields
-from .models import DocumentOut, DocumentStatus
+from .models import ChatRequest, ChatResponse, ChatSource, DocumentModel, DocumentOut, DocumentStatus
 from .queue_sim import JobResult, QueueSimulator
 from .repository import DocumentRepository
 from .search import score_documents
+
+CHAT_CONTEXT_TOP_K = 5
+CHAT_CONTEXT_PER_DOC_CHARS = 8000
+CHAT_CONTEXT_TOTAL_CHARS = 20000
 
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -44,6 +50,16 @@ async def lifespan(app: FastAPI):
     engine = build_engine()
     app.state.engine = engine
     app.state.repository = DocumentRepository(engine)
+
+    # Materializes the compound (session_id, content_hash) unique index
+    # declared on DocumentModel. Wrapped rather than awaited bare: legacy
+    # documents from before session_id existed all share session_id=None,
+    # and if any two of them happen to share a content_hash, index creation
+    # fails with a DuplicateKeyError — that shouldn't be able to crash boot.
+    try:
+        await engine.configure_database([DocumentModel])
+    except Exception as e:
+        print(f"configure_database failed (continuing without the index): {e}")
 
     # Constructed here (not at module import time) so the QueueSimulator's
     # internal asyncio.Queue binds to *this* event loop. Creating it at
@@ -92,6 +108,19 @@ def get_repository(request: Request) -> DocumentRepository:
 
 def get_queue(request: Request) -> QueueSimulator:
     return request.app.state.queue
+
+
+def get_session_id(request: Request) -> str:
+    """No auth in this demo (see README) — session_id is a client-generated
+    anonymous identity the frontend persists in localStorage, sent as an
+    X-Session-Id header. One exception: native EventSource (the SSE events
+    route) can't set custom headers, only a URL, so it falls back to a
+    session_id query param instead — same identity, two ways to transmit it.
+    """
+    session_id = request.headers.get("X-Session-Id") or request.query_params.get("session_id")
+    if not session_id:
+        raise HTTPException(400, "X-Session-Id header or session_id query param required")
+    return session_id
 
 
 # --- The processing "Lambda handler" ---------------------------------------
@@ -163,6 +192,7 @@ async def upload_document(
     file: UploadFile = File(...),
     repo: DocumentRepository = Depends(get_repository),
     queue: QueueSimulator = Depends(get_queue),
+    session_id: str = Depends(get_session_id),
 ):
     if file.content_type != "application/pdf" and not file.filename.endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported in this demo")
@@ -170,16 +200,16 @@ async def upload_document(
     content = await file.read()
     content_hash = hashlib.sha256(content).hexdigest()
 
-    # Idempotency: identical upload returns the existing document instead of
-    # reprocessing it — the same principle used for idempotent SQS consumers,
-    # now enforced with a unique index in Mongo rather than an in-process set.
-    # Exception: a FAILED record is *not* replayed as-is — without this, a
-    # permanently failed job could never be retried by re-uploading the same
-    # file, even after the bug that caused the failure is fixed. Reset it and
-    # re-enqueue instead, using a fresh idempotency key so the queue
-    # simulator's own in-process dedup (which never forgets a key) doesn't
-    # silently drop the retry.
-    existing = await repo.find_by_hash(content_hash)
+    # Idempotency: identical upload (within the same session — see the
+    # (session_id, content_hash) unique index on DocumentModel) returns the
+    # existing document instead of reprocessing it — the same principle used
+    # for idempotent SQS consumers. Exception: a FAILED record is *not*
+    # replayed as-is — without this, a permanently failed job could never be
+    # retried by re-uploading the same file, even after the bug that caused
+    # the failure is fixed. Reset it and re-enqueue instead, using a fresh
+    # idempotency key so the queue simulator's own in-process dedup (which
+    # never forgets a key) doesn't silently drop the retry.
+    existing = await repo.find_by_hash(session_id, content_hash)
     if existing and existing.status != DocumentStatus.FAILED:
         return DocumentOut.from_model(existing)
 
@@ -192,35 +222,84 @@ async def upload_document(
         doc_id = str(existing.id)
         (UPLOAD_DIR / f"{doc_id}.pdf").write_bytes(content)
         EVENT_QUEUES[doc_id] = asyncio.Queue()
-        await queue.enqueue(doc_id, idempotency_key=f"{content_hash}:retry:{time.time()}")
+        await queue.enqueue(doc_id, idempotency_key=f"{session_id}:{content_hash}:retry:{time.time()}")
         return DocumentOut.from_model(existing)
 
-    record = await repo.create(filename=file.filename, content_hash=content_hash)
+    record = await repo.create(filename=file.filename, content_hash=content_hash, session_id=session_id)
     doc_id = str(record.id)
     (UPLOAD_DIR / f"{doc_id}.pdf").write_bytes(content)
     EVENT_QUEUES[doc_id] = asyncio.Queue()
 
-    await queue.enqueue(doc_id, idempotency_key=content_hash)
+    # Namespaced by session_id: without this, two different sessions
+    # uploading byte-identical content would both correctly pass the
+    # find_by_hash check above as separate new documents, but the second
+    # session's enqueue() would silently no-op — the bare content_hash key
+    # was already consumed by the first session — leaving it stuck QUEUED
+    # forever with no error and no event.
+    await queue.enqueue(doc_id, idempotency_key=f"{session_id}:{content_hash}")
     return DocumentOut.from_model(record)
 
 
 @app.get("/documents/{doc_id}", response_model=DocumentOut)
-async def get_document(doc_id: str, repo: DocumentRepository = Depends(get_repository)):
-    record = await repo.get(doc_id)
+async def get_document(
+    doc_id: str,
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    record = await repo.get_scoped(doc_id, session_id)
     if record is None:
         raise HTTPException(404, "Document not found")
     return DocumentOut.from_model(record)
 
 
 @app.get("/documents")
-async def list_documents(repo: DocumentRepository = Depends(get_repository)):
-    records = await repo.list_all()
+async def list_documents(
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    records = await repo.list_by_session(session_id)
     return [DocumentOut.from_model(r) for r in records]
 
 
+@app.delete("/documents/{doc_id}", status_code=204)
+async def delete_document(
+    doc_id: str,
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    """A document mid-flight in the queue when deleted just fails
+    harmlessly: process_document() already handles repo.get() returning
+    None (it looks up by the unscoped get(), unaffected by this delete)."""
+    record = await repo.get_scoped(doc_id, session_id)
+    if record is None:
+        raise HTTPException(404, "Document not found")
+    await repo.delete(record)
+    (UPLOAD_DIR / f"{doc_id}.pdf").unlink(missing_ok=True)
+    EVENT_QUEUES.pop(doc_id, None)
+
+
+@app.delete("/documents", status_code=204)
+async def delete_all_documents(
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    """Clears every document belonging to the caller's session — not the
+    entire collection. (An earlier version of this route wiped every
+    document for every visitor; that's the exact global-blast-radius
+    behavior session scoping exists to eliminate.)"""
+    deleted = await repo.delete_by_session(session_id)
+    for doc in deleted:
+        (UPLOAD_DIR / f"{doc.id}.pdf").unlink(missing_ok=True)
+        EVENT_QUEUES.pop(str(doc.id), None)
+
+
 @app.get("/documents/{doc_id}/events")
-async def document_events(doc_id: str, repo: DocumentRepository = Depends(get_repository)):
-    record = await repo.get(doc_id)
+async def document_events(
+    doc_id: str,
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    record = await repo.get_scoped(doc_id, session_id)
     if record is None:
         raise HTTPException(404, "Document not found")
 
@@ -242,9 +321,75 @@ async def document_events(doc_id: str, repo: DocumentRepository = Depends(get_re
 
 
 @app.get("/search")
-async def search(q: str, repo: DocumentRepository = Depends(get_repository)):
-    docs = await repo.list_done()
+async def search(
+    q: str,
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    docs = await repo.list_done_by_session(session_id)
     return score_documents(q, docs)
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    payload: ChatRequest,
+    repo: DocumentRepository = Depends(get_repository),
+    session_id: str = Depends(get_session_id),
+):
+    """Q&A over already-processed documents.
+
+    Retrieval reuses score_documents() (see search.py) rather than anything
+    new — that's the same naive term-overlap stand-in for real vector
+    search, so upgrading search.py later upgrades chat quality for free.
+    This is synchronous request/response (no queue_sim involved): a failed
+    Claude call isn't a "job" with retry/idempotency semantics, the user
+    just asks again.
+    """
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(400, "query must not be empty")
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return ChatResponse(
+            answer="Chat isn't available — set ANTHROPIC_API_KEY to enable it.",
+            sources=[],
+        )
+
+    done_docs = await repo.list_done_by_session(session_id)
+    if not done_docs:
+        return ChatResponse(answer="No processed documents yet to search.", sources=[])
+
+    ranked = score_documents(query, done_docs)[:CHAT_CONTEXT_TOP_K]
+    if not ranked:
+        return ChatResponse(answer="No processed documents matched your question.", sources=[])
+
+    docs_by_id = {str(d.id): d for d in done_docs}
+    context_docs: list[tuple[str, str, str]] = []
+    sources: list[ChatSource] = []
+    remaining_budget = CHAT_CONTEXT_TOTAL_CHARS
+
+    for result in ranked:
+        if remaining_budget <= 0:
+            break
+        doc = docs_by_id[result["id"]]
+        try:
+            text = _extract_text(UPLOAD_DIR / f"{result['id']}.pdf")
+        except Exception:
+            # Original PDF missing/unreadable — still a real match, so fall
+            # back to the summary already in memory rather than dropping it.
+            text = doc.extracted.summary
+
+        excerpt = text[: min(len(text), CHAT_CONTEXT_PER_DOC_CHARS, remaining_budget)]
+        remaining_budget -= len(excerpt)
+        context_docs.append((doc.filename, doc.extracted.document_type, excerpt))
+        sources.append(ChatSource(id=result["id"], filename=doc.filename, score=result["score"]))
+
+    try:
+        answer = await answer_question(query, context_docs)
+    except Exception:
+        raise HTTPException(502, "chat_provider_unavailable")
+
+    return ChatResponse(answer=answer, sources=sources)
 
 
 @app.get("/admin/dlq")
