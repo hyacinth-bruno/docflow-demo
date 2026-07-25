@@ -116,3 +116,38 @@ input[type="text"] {
   font-size: 13px;
   margin-top: 4px;
 }
+
+.chat-bubble {
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin-top: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.chat-bubble-user { background: rgba(79,140,255,0.1); color: var(--text); }
+.chat-bubble-assistant { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+.chat-bubble-error { background: rgba(248,81,73,0.1); color: var(--err); }
+
+.btn-link-danger {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.btn-link-danger:hover {
+  color: var(--err);
+}
+
+.chat-source-tag {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(139,148,158,0.15);
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-right: 6px;
+}

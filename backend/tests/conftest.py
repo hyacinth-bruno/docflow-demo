@@ -73,9 +73,14 @@ class _LifespanManager:
 
 @pytest_asyncio.fixture
 async def client():
+    # Every route now requires a session identity (see get_session_id in
+    # main.py) — giving the fixture one default header keeps all existing
+    # tests behaving as one implicit session, unchanged, instead of 400ing.
     async with _LifespanManager(app):
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=transport, base_url="http://test", headers={"X-Session-Id": "test-session"}
+        ) as ac:
             yield ac
 
 
@@ -90,12 +95,12 @@ def sample_pdf_bytes() -> bytes:
     return buf.getvalue()
 
 
-async def wait_for_status(client, doc_id, status="done", timeout=5):
+async def wait_for_status(client, doc_id, status="done", timeout=5, headers=None):
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
-        resp = await client.get(f"/documents/{doc_id}")
-        if resp.json()["status"] == status:
+        resp = await client.get(f"/documents/{doc_id}", headers=headers)
+        if resp.status_code == 200 and resp.json()["status"] == status:
             return resp.json()
         await asyncio.sleep(0.1)
     raise TimeoutError(f"document {doc_id} did not reach status={status} in {timeout}s")
