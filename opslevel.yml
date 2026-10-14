@@ -1,0 +1,49 @@
+---
+version: 1
+component:
+  name: DocFlow Demo
+  type: service
+  lifecycle: available
+  tier: tier_3
+  product:
+  owner:
+  system:
+  language: Python
+  framework: FastAPI
+  description: Async document processing demo with extraction, persistence, real-time progress, and search
+  aliases:
+    - docflow-demo
+  tags:
+  repositories:
+    - name: hyacinth-bruno/docflow-demo
+      path: "/"
+      provider: github
+  tools:
+  dependencies:
+  alert_sources:
+  properties:
+    authentication:
+      - None
+    authorization:
+      - None
+    cache:
+      - None
+    data_classification:
+      - None
+    database:
+      - MongoDB
+    hosting:
+      - Fly.io
+      - Render
+    message_queue_cluster:
+      - In-process asyncio queue
+    messaging:
+      - None
+    ownership_confidence: High
+    public_endpoint:
+    service_configuration:
+      - Environment variables
+    static_content_hosting:
+      - None
+    storage:
+      - Local disk
