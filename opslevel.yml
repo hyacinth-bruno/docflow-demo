@@ -6,7 +6,7 @@ component:
   lifecycle: available
   tier: tier_3
   product:
-  owner:
+  owner: sec_pe_team_atlas
   system:
   language: Python
   framework: FastAPI
